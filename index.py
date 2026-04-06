@@ -272,17 +272,15 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
         df['source_file'] = os.path.splitext(os.path.basename(path))[0]
 
         # Определяем тип файла (Polar или Garmin) – можно по наличию колонки 'sport'
-        is_polar = 'Sport' in df.columns
+        is_polar = any(col in df.columns for col in ['Sport', 'Вид спорта'])
 
         # Определяем колонки для даты, длительности и нагрузки
         if is_polar:
             # Для Polar
-            date_col = detect_column(df, ["день", "date", "day", "start_date_local"], required=True, label="date")
-            duration_col = detect_column(df, ["продолжительность", "duration", "moving_time"], required=True, label="duration")
-            cardio_col = detect_column(df, ["кардионагрузка", "cardio load", "тренировочная нагрузка", "icu_training_load"],
-                                       required=True, label="cardio load")
-            # Имя спортсмена: ищем в колонках или берём из имени файла
-            user_col = detect_column(df, ["имя", "фио", "athlete", "user", "name"], required=False)
+            date_col = detect_column(df, ["день", "дата", "date", "day", "start_date_local"], required=True, label="date")
+            duration_col = detect_column(df, ["продолжительность", "длительность", "duration", "moving_time"], required=True, label="duration")
+            cardio_col = detect_column(df, ["кардионагрузка", "тренировочная нагрузка", "cardio load", "icu_training_load"], required=True, label="cardio load")
+            user_col = detect_column(df, ["имя", "спортсмен", "athlete", "user", "name"], required=False)
             athlete_name = df[user_col] if user_col is not None else df['source_file']
         else:
             # Для Garmin (и других форматов) – подставьте реальные названия колонок
