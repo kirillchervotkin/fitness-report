@@ -96,7 +96,16 @@ def read_csv_robust(file_path):
     return best_df
 
 def parse_duration_to_seconds(series):
-    return pd.to_timedelta(series.astype(str).str.strip(), errors="coerce").dt.total_seconds()
+    # 1. Пытаемся интерпретировать как число (секунды)
+    numeric_seconds = pd.to_numeric(series, errors='coerce')
+    
+    # 2. Пытаемся интерпретировать как timedelta (форматы HH:MM:SS и т.п.)
+    timedelta_seconds = pd.to_timedelta(series.astype(str).str.strip(), errors='coerce').dt.total_seconds()
+    
+    # 3. Объединяем: берём числовые секунды, где они есть, иначе — из timedelta
+    result = numeric_seconds.combine_first(timedelta_seconds)
+    
+    return result
 
 def apply_role_group(value):
     text = normalize_text(value).lower()
@@ -231,6 +240,12 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
         if log_callback:
             log_callback(msg)
 
+    import os
+    import tempfile
+    import zipfile
+    import glob
+    import pandas as pd
+
     # ---- Распаковка ZIP и сбор CSV ----
     temp_dir = tempfile.mkdtemp(prefix="polar_extract_")
     csv_paths = []
@@ -247,26 +262,61 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
 
     log(f"Найдено CSV файлов: {len(csv_paths)}")
 
-    # ---- Чтение всех CSV ----
+    # ---- Чтение всех CSV с приведением к единому формату ----
     frames = []
     for path in csv_paths:
-        frames.append(read_csv_robust(path))
+        df = read_csv_robust(path)
+        df.columns = normalize_columns(df.columns)
+
+        # Добавляем имя файла (может пригодиться для отладки)
+        df['source_file'] = os.path.splitext(os.path.basename(path))[0]
+
+        # Определяем тип файла (Polar или Garmin) – можно по наличию колонки 'sport'
+        is_polar = 'Sport' in df.columns
+
+        # Определяем колонки для даты, длительности и нагрузки
+        if is_polar:
+            # Для Polar
+            date_col = detect_column(df, ["день", "date", "day", "start_date_local"], required=True, label="date")
+            duration_col = detect_column(df, ["продолжительность", "duration", "moving_time"], required=True, label="duration")
+            cardio_col = detect_column(df, ["кардионагрузка", "cardio load", "тренировочная нагрузка", "icu_training_load"],
+                                       required=True, label="cardio load")
+            # Имя спортсмена: ищем в колонках или берём из имени файла
+            user_col = detect_column(df, ["имя", "фио", "athlete", "user", "name"], required=False)
+            athlete_name = df[user_col] if user_col is not None else df['source_file']
+        else:
+            # Для Garmin (и других форматов) – подставьте реальные названия колонок
+            date_col = detect_column(df, ["start_date_local"], required=True, label="date")
+            duration_col = detect_column(df, ["moving_time"], required=True, label="duration")
+            cardio_col = detect_column(df, ["icu_training_load"], required=True, label="cardio load")
+            # Имя спортсмена: пока берём из имени файла
+            athlete_name = df['source_file'].str.split('_').str[0]
+
+        # Преобразуем данные
+        session_dt = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
+        duration_sec = parse_duration_to_seconds(df[duration_col]).fillna(0)
+        cardio_load = pd.to_numeric(df[cardio_col], errors='coerce').fillna(0)
+
+        # Создаём универсальный DataFrame с едиными колонками
+        unified_df = pd.DataFrame({
+            'athlete_name': athlete_name,
+            'Session DateTime': session_dt,
+            'Duration Seconds': duration_sec,
+            'Total Cardioload': cardio_load,
+            'source_file': df['source_file']
+        })
+        # Убираем строки без даты
+        unified_df = unified_df[unified_df['Session DateTime'].notna()].copy()
+        frames.append(unified_df)
+
+    # Объединяем все универсальные данные
     polar_df = pd.concat(frames, ignore_index=True)
-    polar_df.columns = normalize_columns(polar_df.columns)
-    log(f"Всего строк в Polar данных: {len(polar_df)}")
 
-    # ---- Определение колонок ----
-    name_col = detect_column(polar_df, ["имя", "фио", "name", "athlete", "user"], required=True, label="athlete name")
-    date_col = detect_column(polar_df, ["день", "date", "day"], required=True, label="date")
-    duration_col = detect_column(polar_df, ["продолжительность", "duration"], required=True, label="duration")
-    cardio_col = detect_column(polar_df, ["кардионагрузка", "cardio load", "тренировочная нагрузка"], required=True, label="cardio load")
-
-    # ---- Очистка и преобразование ----
-    polar_df["CSV Name"] = polar_df[name_col].map(normalize_text)
-    polar_df["Session DateTime"] = pd.to_datetime(polar_df[date_col], errors="coerce", dayfirst=True)
+    # Дальше идёт тот же код, но без detect_column – все нужные колонки уже есть
+    polar_df["CSV Name"] = polar_df["athlete_name"].map(normalize_text)
     polar_df["Session Date"] = polar_df["Session DateTime"].dt.normalize()
-    polar_df["Duration Seconds"] = parse_duration_to_seconds(polar_df[duration_col]).fillna(0)
-    polar_df["Total Cardioload"] = pd.to_numeric(polar_df[cardio_col], errors="coerce").fillna(0)
+
+    # Фильтрация
     polar_df = polar_df[(polar_df["CSV Name"] != "") & (polar_df["Session DateTime"].notna())].copy()
     if polar_df.empty:
         raise ValueError("No valid Polar rows after cleaning.")
@@ -325,6 +375,7 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
             df_sheet.columns = normalize_columns(df_sheet.columns)
             frames_master.append(df_sheet)
         master_df = pd.concat(frames_master, ignore_index=True)
+    
         referee_col = detect_column(master_df, ["referee name", "имя", "full name", "name"], required=True)
         polar_col = detect_column(master_df, ["polar name", "имя polar", "polar"], required=True)
         gender_col = detect_column(master_df, ["gender", "пол"], required=True)
