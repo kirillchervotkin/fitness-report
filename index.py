@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
 import re
-import glob
-import zipfile
-import tempfile
 import threading
 import unicodedata
 import shutil
@@ -16,7 +13,7 @@ from openpyxl.styles import PatternFill, Border, Side, Font, Alignment
 
 # ========================= НАСТРОЙКИ ПО УМОЛЧАНИЮ =========================
 DEFAULT_SETTINGS = {
-    "week_filter_mode": "latest",          # "latest" или "manual"
+    "week_filter_mode": "latest",
     "target_year": 2026,
     "target_week": 12,
     "league_filter": "",
@@ -96,15 +93,9 @@ def read_csv_robust(file_path):
     return best_df
 
 def parse_duration_to_seconds(series):
-    # 1. Пытаемся интерпретировать как число (секунды)
     numeric_seconds = pd.to_numeric(series, errors='coerce')
-    
-    # 2. Пытаемся интерпретировать как timedelta (форматы HH:MM:SS и т.п.)
     timedelta_seconds = pd.to_timedelta(series.astype(str).str.strip(), errors='coerce').dt.total_seconds()
-    
-    # 3. Объединяем: берём числовые секунды, где они есть, иначе — из timedelta
     result = numeric_seconds.combine_first(timedelta_seconds)
-    
     return result
 
 def apply_role_group(value):
@@ -148,38 +139,30 @@ def format_workbook(output_path, settings):
     dur_yellow_seconds = pd.to_timedelta(settings["dur_yellow_low"]).total_seconds()
     
     for ws in wb.worksheets:
-        # Получаем заголовки (первая строка)
         headers = {}
         for idx, cell in enumerate(ws[1], start=1):
             if cell.value is not None:
                 headers[cell.value] = idx
         
-        # Оформление заголовков
         for cell in ws[1]:
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = header_alignment
-            if cell.value not in [None, ""]:
+        
+        # Применяем рамки ко всем ячейкам в используемом диапазоне
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in row:
                 cell.border = border
         
-        # Границы для всех ячеек
-        for row in ws.iter_rows():
-            for cell in row:
-                if cell.value not in [None, ""]:
-                    cell.border = border
-        
-        # Формат времени для длительности
         if "Total Duration" in headers:
             for row_idx in range(2, ws.max_row + 1):
                 ws.cell(row_idx, headers["Total Duration"]).number_format = "[h]:mm:ss"
         
-        # Формат дат
         for date_col_name in ["Week Start", "Week End"]:
             if date_col_name in headers:
                 for row_idx in range(2, ws.max_row + 1):
                     ws.cell(row_idx, headers[date_col_name]).number_format = "dd.mm.yyyy"
         
-        # Условное форматирование (если все необходимые колонки присутствуют)
         required_cols = ["Training Days", "Total Duration", "Total Duration Seconds", "Total Cardioload"]
         if all(col in headers for col in required_cols):
             for row_idx in range(2, ws.max_row + 1):
@@ -216,12 +199,10 @@ def format_workbook(output_path, settings):
                 else:
                     cardio_cell.fill = red_fill
         
-        # Скрыть вспомогательную колонку
         if "Total Duration Seconds" in headers:
             col_letter = ws.cell(row=1, column=headers["Total Duration Seconds"]).column_letter
             ws.column_dimensions[col_letter].hidden = True
         
-        # Автоширина колонок
         for col_cells in ws.columns:
             max_len = 0
             letter = col_cells[0].column_letter
@@ -234,7 +215,7 @@ def format_workbook(output_path, settings):
     
     wb.save(output_path)
 
-# ========================= ОСНОВНАЯ ЛОГИКА ГЕНЕРАЦИИ ОТЧЁТА =========================
+# ========================= ОСНОВНАЯ ЛОГИКА =========================
 def generate_report(polar_file_paths, master_file_path, settings, log_callback):
     def log(msg):
         if log_callback:
@@ -246,7 +227,6 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
     import glob
     import pandas as pd
 
-    # ---- Распаковка ZIP и сбор CSV ----
     temp_dir = tempfile.mkdtemp(prefix="polar_extract_")
     csv_paths = []
     for path in polar_file_paths:
@@ -262,40 +242,54 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
 
     log(f"Найдено CSV файлов: {len(csv_paths)}")
 
-    # ---- Чтение всех CSV с приведением к единому формату ----
     frames = []
     for path in csv_paths:
         df = read_csv_robust(path)
         df.columns = normalize_columns(df.columns)
 
-        # Добавляем имя файла (может пригодиться для отладки)
         df['source_file'] = os.path.splitext(os.path.basename(path))[0]
 
-        # Определяем тип файла (Polar или Garmin) – можно по наличию колонки 'sport'
+        # Определяем тип файла
         is_polar = any(col in df.columns for col in ['Sport', 'Вид спорта'])
+        # Для надёжности: если есть start_date_local и нет Sport, то это Garmin
+        if not is_polar and 'start_date_local' in df.columns:
+            is_polar = False
+        elif 'Sport' in df.columns:
+            is_polar = True
 
-        # Определяем колонки для даты, длительности и нагрузки
         if is_polar:
-            # Для Polar
             date_col = detect_column(df, ["день", "дата", "date", "day", "start_date_local"], required=True, label="date")
             duration_col = detect_column(df, ["продолжительность", "длительность", "duration", "moving_time"], required=True, label="duration")
-            cardio_col = detect_column(df, ["кардионагрузка", "тренировочная нагрузка", "cardio load", "icu_training_load"], required=True, label="cardio load")
+            cardio_col = detect_column(df, ["кардионагрузка", "тренировочная нагрузка", "cardio load", "hr_load"], required=True, label="cardio load")
             user_col = detect_column(df, ["имя", "спортсмен", "athlete", "user", "name"], required=False)
             athlete_name = df[user_col] if user_col is not None else df['source_file']
         else:
-            # Для Garmin (и других форматов) – подставьте реальные названия колонок
             date_col = detect_column(df, ["start_date_local"], required=True, label="date")
             duration_col = detect_column(df, ["moving_time"], required=True, label="duration")
-            cardio_col = detect_column(df, ["icu_training_load"], required=True, label="cardio load")
-            # Имя спортсмена: пока берём из имени файла
+            cardio_col = detect_column(df, ["hr_load"], required=True, label="cardio load")
             athlete_name = df['source_file'].str.split('_').str[0]
 
-        # Преобразуем данные
-        session_dt = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
+        date_series = df[date_col].astype(str).str.strip()
+
+        if is_polar:
+            # Polar: формат день-месяц-год, разделитель '-' или '.'
+            sample = date_series.dropna().iloc[0] if not date_series.dropna().empty else ""
+            if '.' in sample:
+                sep = '.'
+            else:
+                sep = '-'
+            if ':' in sample:
+                session_dt = pd.to_datetime(date_series, format=f'%d{sep}%m{sep}%Y %H:%M:%S', errors='coerce')
+            else:
+                session_dt = pd.to_datetime(date_series, format=f'%d{sep}%m{sep}%Y', errors='coerce')
+        else:
+            # Garmin: стандартный ISO (год-месяц-день)
+            session_dt = pd.to_datetime(date_series, errors='coerce')
+            log(f"Garmin дата образец: '{date_series.iloc[0]}' -> '{session_dt.iloc[0]}'")
+
         duration_sec = parse_duration_to_seconds(df[duration_col]).fillna(0)
         cardio_load = pd.to_numeric(df[cardio_col], errors='coerce').fillna(0)
 
-        # Создаём универсальный DataFrame с едиными колонками
         unified_df = pd.DataFrame({
             'athlete_name': athlete_name,
             'Session DateTime': session_dt,
@@ -303,28 +297,22 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
             'Total Cardioload': cardio_load,
             'source_file': df['source_file']
         })
-        # Убираем строки без даты
         unified_df = unified_df[unified_df['Session DateTime'].notna()].copy()
         frames.append(unified_df)
 
-    # Объединяем все универсальные данные
     polar_df = pd.concat(frames, ignore_index=True)
 
-    # Дальше идёт тот же код, но без detect_column – все нужные колонки уже есть
     polar_df["CSV Name"] = polar_df["athlete_name"].map(normalize_text)
     polar_df["Session Date"] = polar_df["Session DateTime"].dt.normalize()
 
-    # Фильтрация
     polar_df = polar_df[(polar_df["CSV Name"] != "") & (polar_df["Session DateTime"].notna())].copy()
     if polar_df.empty:
         raise ValueError("No valid Polar rows after cleaning.")
 
-    # ---- Определение недель ----
     iso = polar_df["Session DateTime"].dt.isocalendar()
     polar_df["Year"] = iso["year"].astype(int)
     polar_df["Week Number"] = iso["week"].astype(int)
 
-    # ---- Выбор недели ----
     if settings["week_filter_mode"] == "latest":
         latest = polar_df[["Year", "Week Number"]].drop_duplicates().sort_values(["Year", "Week Number"]).tail(1)
         selected_year = int(latest.iloc[0]["Year"])
@@ -338,12 +326,10 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
     if polar_df.empty:
         raise ValueError("No data for selected week.")
 
-    # Удаление дубликатов
     before = len(polar_df)
     polar_df = polar_df.drop_duplicates(subset=["CSV Name", "Session Date", "Duration Seconds", "Total Cardioload"], keep="first")
     log(f"Удалено дубликатов строк: {before - len(polar_df)}")
 
-    # ---- Агрегация по спортсменам ----
     aggregated = (polar_df.groupby(["CSV Name", "Year", "Week Number"])
                   .agg(Training_Days=("Session Date", "nunique"),
                        Total_Duration_Seconds=("Duration Seconds", "sum"),
@@ -351,19 +337,16 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
                   .reset_index())
     aggregated["Training_Days"] = aggregated["Training_Days"].astype(int)
 
-    # ========== ИСПРАВЛЕНИЕ: переименование колонок для единообразия ==========
     aggregated.rename(columns={
         "Training_Days": "Training Days",
         "Total_Duration_Seconds": "Total Duration Seconds",
-        "Total_Cardioload": "Total Cardioload"          # <-- добавлено
+        "Total_Cardioload": "Total Cardioload"
     }, inplace=True)
-    # =========================================================================
 
     log(f"Агрегировано записей: {len(aggregated)}")
 
-    # ---- Мастер-лист ----
     use_master = master_file_path and os.path.exists(master_file_path)
-    master_effective = False   # флаг, что мастер-лист реально использован (не пуст после фильтрации)
+    master_effective = False
     
     if use_master:
         xls = pd.ExcelFile(master_file_path)
@@ -385,12 +368,10 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
             master_df[col] = master_df[col].fillna("").map(normalize_text)
         master_df = master_df[master_df["Referee Name"] != ""].copy().drop_duplicates(subset=["Referee Name"])
         
-        # Фильтр по лиге
         league_filter_norm = normalize_text(settings["league_filter"])
         if league_filter_norm:
             master_df = master_df[master_df["League"] == league_filter_norm].copy()
         
-        # Если мастер-лист не пуст, используем его для слияния
         if not master_df.empty:
             master_effective = True
             log(f"Мастер-лист загружен, строк: {len(master_df)}")
@@ -404,7 +385,6 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
             merge_col = "_polar_key" if merge_mode == "Polar Name" else "_ref_key"
             log(f"Режим слияния: {merge_mode} (совпадений {polar_overlap} vs {ref_overlap})")
             final_df = master_df.merge(aggregated, left_on=merge_col, right_on="_csv_key", how="left", suffixes=("", "_agg"))
-            # Теперь колонки уже имеют правильные имена "Training Days", "Total Duration Seconds", "Total Cardioload"
             final_df["Year"] = final_df["Year"].fillna(selected_year).astype(int)
             final_df["Week Number"] = final_df["Week Number"].fillna(selected_week).astype(int)
             final_df["Training Days"] = final_df["Training Days"].fillna(0).astype(int)
@@ -413,19 +393,19 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
             final_df.drop(columns=["_csv_key", "_polar_key", "_ref_key"], errors="ignore", inplace=True)
             if "CSV Name" in final_df.columns:
                 final_df.drop(columns=["CSV Name"], inplace=True)
+            final_df["Comments"] = ""  # Пустое поле для комментариев
         else:
             log("Мастер-лист пуст после фильтрации по лиге. Отчёт будет построен без мастер-листа.")
     
-    # Если мастер-лист не использован (либо не выбран, либо пуст)
     if not master_effective:
         final_df = aggregated.copy()
         final_df["Referee Name"] = final_df["CSV Name"]
         final_df["Gender"] = ""
         final_df["Role"] = ""
         final_df["League"] = ""
+        final_df["Comments"] = ""  # Пустое поле для комментариев
         final_df.drop(columns=["CSV Name"], inplace=True)
 
-    # ---- Итоговые колонки ----
     week_start = pd.Timestamp.fromisocalendar(selected_year, selected_week, 1)
     week_end = pd.Timestamp.fromisocalendar(selected_year, selected_week, 7)
     final_df["Week Start"] = week_start
@@ -433,15 +413,13 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
     final_df["Total Duration"] = pd.to_timedelta(final_df["Total Duration Seconds"], unit="s")
     final_df["Total Cardioload"] = final_df["Total Cardioload"].round(2)
 
-    # Приводим текстовые колонки к единому формату
     for col in ["Referee Name", "Gender", "Role", "League"]:
         if col in final_df.columns:
             final_df[col] = final_df[col].fillna("").map(normalize_text)
 
-    # Убедимся, что все необходимые колонки существуют (на случай, если агрегация не дала какого-то столбца)
     required_final_cols = ["Referee Name", "Gender", "Role", "League", "Year", "Week Number",
                            "Week Start", "Week End", "Training Days", "Total Duration",
-                           "Total Duration Seconds", "Total Cardioload"]
+                           "Total Duration Seconds", "Total Cardioload", "Comments"]
     for col in required_final_cols:
         if col not in final_df.columns:
             if col in ["Training Days", "Year", "Week Number"]:
@@ -450,13 +428,13 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
                 final_df[col] = 0.0
             elif col == "Total Duration":
                 final_df[col] = pd.Timedelta(0)
-            else:  # строковые
+            elif col == "Comments":
+                final_df[col] = ""
+            else:
                 final_df[col] = ""
 
-    # Порядок колонок
     final_df = final_df[required_final_cols].copy()
 
-    # ---- Дополнительные листы по ролям и лигам (только если использован мастер-лист) ----
     extra_sheets = {}
     if master_effective:
         role_groups = final_df["Role"].apply(apply_role_group)
@@ -479,7 +457,6 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
             if not league_asst.empty:
                 extra_sheets[f"{league_norm}_Assistants"] = league_asst
 
-    # ---- Формирование имени выходного файла ----
     league_suffix = f"_{normalize_text(settings['league_filter'])}" if settings["league_filter"] else ""
     week_start_str = week_start.strftime("%d.%m.%Y")
     week_end_str = week_end.strftime("%d.%m.%Y")
@@ -487,7 +464,6 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
                        f"{week_start_str}-{week_end_str}.xlsx")
     output_path = os.path.join(os.getcwd(), output_filename)
 
-    # Сохраняем Excel
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         final_df.to_excel(writer, sheet_name="All", index=False)
         used = {"All"}
@@ -496,7 +472,6 @@ def generate_report(polar_file_paths, master_file_path, settings, log_callback):
             df_sheet.to_excel(writer, sheet_name=safe_name, index=False)
     format_workbook(output_path, settings)
 
-    # Очистка временной папки
     shutil.rmtree(temp_dir, ignore_errors=True)
     return output_path
 
@@ -507,11 +482,9 @@ class PolarReportApp:
         self.root.title("Polar Training Report Generator")
         self.root.geometry("800x700")
 
-        # Переменные для файлов
-        self.polar_files = []          # список путей к выбранным файлам
+        self.polar_files = []
         self.master_file = None
 
-        # Настройки
         self.settings = DEFAULT_SETTINGS.copy()
         self.week_filter_var = tk.StringVar(value=self.settings["week_filter_mode"])
         self.target_year_var = tk.StringVar(value=str(self.settings["target_year"]))
@@ -525,14 +498,12 @@ class PolarReportApp:
         self.cardio_yellow_low_var = tk.StringVar(value=str(self.settings["cardio_yellow_low"]))
         self.output_base_var = tk.StringVar(value=self.settings["output_base"])
 
-        # Построение интерфейса
         self.create_widgets()
 
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 1. Файлы Polar
         file_frame = ttk.LabelFrame(main_frame, text="1. Данные Polar (CSV / ZIP)", padding="5")
         file_frame.pack(fill=tk.X, pady=5)
 
@@ -547,7 +518,6 @@ class PolarReportApp:
         ttk.Button(btn_frame, text="Добавить файлы", command=self.add_polar_files).pack(pady=2)
         ttk.Button(btn_frame, text="Очистить список", command=self.clear_polar_files).pack(pady=2)
 
-        # 2. Мастер-лист (опционально)
         master_frame = ttk.LabelFrame(main_frame, text="2. Мастер-лист (Excel) – опционально", padding="5")
         master_frame.pack(fill=tk.X, pady=5)
 
@@ -556,11 +526,9 @@ class PolarReportApp:
         ttk.Button(master_frame, text="Выбрать файл", command=self.select_master_file).pack(side=tk.RIGHT, padx=5)
         ttk.Button(master_frame, text="Очистить", command=self.clear_master_file).pack(side=tk.RIGHT, padx=5)
 
-        # 3. Настройки отчёта
         settings_frame = ttk.LabelFrame(main_frame, text="3. Параметры отчёта", padding="5")
         settings_frame.pack(fill=tk.X, pady=5)
 
-        # Режим недели
         week_mode_frame = ttk.Frame(settings_frame)
         week_mode_frame.pack(fill=tk.X, pady=2)
         ttk.Label(week_mode_frame, text="Выбор недели:").pack(side=tk.LEFT)
@@ -573,13 +541,11 @@ class PolarReportApp:
         self.week_spin.pack(side=tk.LEFT, padx=2)
         ttk.Label(week_mode_frame, text="неделя").pack(side=tk.LEFT)
 
-        # Лига
         league_frame = ttk.Frame(settings_frame)
         league_frame.pack(fill=tk.X, pady=2)
         ttk.Label(league_frame, text="Фильтр по лиге (оставьте пустым для всех):").pack(side=tk.LEFT)
         ttk.Entry(league_frame, textvariable=self.league_filter_var, width=20).pack(side=tk.LEFT, padx=5)
 
-        # Пороги
         thresh_frame = ttk.LabelFrame(settings_frame, text="Пороговые значения", padding="5")
         thresh_frame.pack(fill=tk.X, pady=5)
 
@@ -603,13 +569,11 @@ class PolarReportApp:
         ttk.Label(grid, text="Жёлтый от").grid(row=2, column=3, padx=5)
         ttk.Entry(grid, width=5, textvariable=self.cardio_yellow_low_var).grid(row=2, column=4)
 
-        # Имя выходного файла
         out_frame = ttk.Frame(settings_frame)
         out_frame.pack(fill=tk.X, pady=2)
         ttk.Label(out_frame, text="База имени выходного файла:").pack(side=tk.LEFT)
         ttk.Entry(out_frame, textvariable=self.output_base_var, width=30).pack(side=tk.LEFT, padx=5)
 
-        # 4. Кнопка запуска и лог
         btn_frame2 = ttk.Frame(main_frame)
         btn_frame2.pack(fill=tk.X, pady=10)
         self.run_btn = ttk.Button(btn_frame2, text="Сформировать отчёт", command=self.run_report)
